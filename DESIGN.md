@@ -8,7 +8,7 @@ integration, and no frontend — consistent with the assessment's scope boundari
 
 The repository's starter was an empty Maven/Java 17 project with no domain model, so this was
 treated as the "minimal service" fallback: a plain, framework-free Java library with an
-in-memory store, exercised by a small CLI demo (`Main`) and verified by JUnit 5 tests.
+in-memory store, exercised by the `org.com.dcp.Application` CLI demo and verified by JUnit 5 tests.
 
 ## 2. Data Model
 
@@ -24,7 +24,7 @@ in-memory store, exercised by a small CLI demo (`Main`) and verified by JUnit 5 
 ## 3. API (service boundary)
 
 ```
-registerLearner(Learner)                 -> void      (idempotent upsert into the roster)
+registerLearner(Learner)                 -> void      (idempotent upsert; may promote eligible waitlisted learners)
 enroll(String learnerId)                 -> EnrollmentResult
 drop(String learnerId)                   -> DropResult
 getEnrolledLearnerIds()                  -> List<String>  (snapshot, insertion order)
@@ -44,7 +44,7 @@ CourseRegistrationService service = new CourseRegistrationService(
 
 service.registerLearner(new Learner("alice", "Alice A.", Set.of("CS-101")));
 service.registerLearner(new Learner("bob",   "Bob B.",   Set.of("CS-101")));
-service.registerLearner(new Learner("carol", "Carol C.", Set.of()));        // no prerequisite
+service.registerLearner(new Learner("carol", "Carol C.", Set.of()));        // has not completed CS-101
 
 service.enroll("alice");  // -> ENROLLED        (1/2 seats used)
 service.enroll("bob");    // -> ENROLLED        (2/2 seats used, now full)
@@ -55,8 +55,8 @@ DropResult result = service.drop("alice");
 // -> DROPPED, promotedLearnerId == null (no eligible waitlisted learner existed)
 ```
 
-Every call returns a typed result the caller branches on — there is no boolean/`null` return a
-caller could misinterpret or ignore.
+Enrollment and drop operations return typed results for callers to branch on. Registration returns
+`void`; roster accessors return immutable snapshots.
 
 ## 4. Enrollment & Capacity Invariants
 
@@ -67,6 +67,8 @@ caller could misinterpret or ignore.
 4. Waitlist order is FIFO; insertion order is preserved via `ArrayDeque` with duplicate
    prevention via a `contains` check (acceptable at this list's expected scale; a sorted
    `Set` indexed by join-sequence would be the next optimization if waitlists grew large).
+5. After each public state change, no available seat is left unfilled when an eligible
+   waitlisted learner exists.
 
 ## 5. Prerequisite / Waitlist-Promotion Policy (stated assumption)
 
@@ -84,13 +86,22 @@ caller could misinterpret or ignore.
   of one failed promotion attempt; they should get another chance once eligible again.
 - If no eligible learner is found anywhere in the waitlist, the seat is simply left open
   (`promotedLearnerId == null`).
+- **Existing waitlist has priority**: before a new eligible learner takes an open seat,
+  `enroll()` promotes eligible waitlisted learners in FIFO order. If no queued learner is
+  eligible, the new learner may take the seat; skipped ineligible learners remain queued.
+- **A waitlisted learner retries `enroll()`**: the service retries FIFO promotion. If that learner
+  is promoted, the result is `ENROLLED`; otherwise it remains queued and receives
+  `ALREADY_WAITLISTED`.
+- **Roster updates retry promotion**: `registerLearner()` checks for available seats after every
+  upsert. If an updated learner becomes eligible while queued, they are promoted when their FIFO
+  turn is reached. This closes the open-seat gap without discarding ineligible entries.
 
 This policy is covered directly by
 `ineligibleWaitlistedLearnerIsSkippedButRetainedDuringPromotion` in the test suite.
 
 ## 6. Concurrency Approach
 
-All mutation (`enroll`, `drop`, the internal promotion step) and all snapshot reads are guarded
+All mutation (`registerLearner`, `enroll`, `drop`, promotion) and all snapshot reads are guarded
 by a single `ReentrantLock` on the service instance, making "check capacity, then add" and "drop,
 then promote" atomic with respect to each other. This is intentionally coarse-grained:
 
@@ -146,7 +157,8 @@ reason to exist rather than being generic coverage:
 | Unknown learner / unknown drop target | Returns a typed `UNKNOWN_LEARNER` result, never throws, never mutates state | AC5 — invalid requests must fail safely |
 | Drop of a waitlisted-but-never-enrolled learner | Returns `NOT_ENROLLED` and leaves the waitlist untouched | AC5 — a gap I found during self-review (see `AI-USAGE.md` Phase 5); confirms drop can't be used to covertly remove a waitlist entry |
 | Repeated/duplicate drop | Second drop on an already-dropped learner is a safe no-op, not a corrupting double-promotion | AC5 — guards against a seat being "opened" twice for one real vacancy |
-| Concurrency (100 threads vs. 10 seats) | Final enrolled count never exceeds capacity; nobody is duplicated or lost under simultaneous requests | AC6 — the assessment explicitly asks for a concurrency test when the design involves locking |
+| Concurrency (100 enrollments vs. 10 seats) | Final enrolled count never exceeds capacity; nobody is duplicated or lost under simultaneous requests | AC6 — the assessment explicitly asks for a concurrency test when the design involves locking |
+| Concurrent drops and enrollments | Concurrently opened seats are filled from the existing FIFO waitlist; all remaining eligible learners are represented exactly once | Promotion and enrollment contend for the same capacity and queue invariants |
 
 Each row corresponds to exactly one test method in `CourseRegistrationServiceTest` or
 `CourseRegistrationServiceConcurrencyTest` — there is no category of acceptance-criteria behavior
@@ -160,7 +172,8 @@ left unverified, and there is no test that exists purely for coverage-percentage
   enrolled) was requested by the acceptance criteria, so it isn't implemented; `drop()` is scoped
   to enrolled learners only, matching AC3's wording ("dropping an enrolled learner").
 - `Learner.completedCourseIds` is mutable only via re-registration (`registerLearner` upsert);
-  there's no dedicated "record prerequisite completion" API, since that's outside this slice.
+  that upsert retries promotion if it makes a waitlisted learner eligible. There's no dedicated
+  "record prerequisite completion" API, since that's outside this slice.
 - Single course offering per service instance by design — matches "implement only one offering's
   slice" in the scope boundaries. Supporting multiple offerings would mean one service instance
   (or one lock) per offering, not a shared global lock.
@@ -172,7 +185,8 @@ left unverified, and there is no test that exists purely for coverage-percentage
 - `waitlist.contains()` for duplicate checks is O(n); irrelevant at expected waitlist sizes, but
   would need an index (e.g. `Set<String>` mirrored alongside the `Deque`) if waitlists grew large.
 - No notification/acceptance workflow for promoted learners (e.g. "you have 24 hours to confirm")
-  — out of scope here, but a real Register product would need it before a promotion is final.
+  — out of scope here, but a production course-registration system would need it before a
+  promotion is final.
 - No audit trail / event log of enrollment and promotion decisions; would be valuable for support
   and dispute resolution in a production system.
 - **Logging**: `CourseRegistrationService` logs via SLF4J — INFO for business events (enroll,

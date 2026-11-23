@@ -33,10 +33,11 @@ import java.util.concurrent.locks.ReentrantLock;
  * one failed promotion attempt.
  *
  * <p><b>Concurrency:</b> a single {@link ReentrantLock} guards all state mutation and snapshot
- * reads, making enroll/drop/promote atomic with respect to one another. This is intentionally
- * coarse-grained: correct and simple for a single in-memory offering of this bounded scope. A
- * higher-throughput or persistent implementation would replace this with per-offering database
- * transactions (e.g. {@code SELECT ... FOR UPDATE} on the offering row) instead of an in-process lock.
+ * reads, making register/enroll/drop/promote atomic with respect to one another. This is
+ * intentionally coarse-grained: correct and simple for a single in-memory offering of this
+ * bounded scope. A higher-throughput or persistent implementation would replace this with
+ * per-offering database transactions (e.g. {@code SELECT ... FOR UPDATE} on the offering row)
+ * instead of an in-process lock.
  */
 public final class CourseRegistrationService {
 
@@ -59,6 +60,7 @@ public final class CourseRegistrationService {
         try {
             directory.register(learner);
             log.debug("Learner registered, learnerId={}, courseId={}", learner.getId(), offering.getId());
+            promoteAvailableSeats();
         } finally {
             lock.unlock();
         }
@@ -81,6 +83,11 @@ public final class CourseRegistrationService {
                         "Learner " + learnerId + " is already enrolled");
             }
             if (waitlist.contains(learnerId)) {
+                promoteAvailableSeats();
+                if (enrolled.contains(learnerId)) {
+                    return new EnrollmentResult(EnrollmentStatus.ENROLLED,
+                            "Learner " + learnerId + " promoted from the waitlist");
+                }
                 log.warn("Enrollment rejected: already waitlisted, learnerId={}, courseId={}", learnerId, offering.getId());
                 return new EnrollmentResult(EnrollmentStatus.ALREADY_WAITLISTED,
                         "Learner " + learnerId + " is already on the waitlist");
@@ -90,6 +97,7 @@ public final class CourseRegistrationService {
                 return new EnrollmentResult(EnrollmentStatus.INELIGIBLE,
                         "Learner " + learnerId + " does not meet the prerequisite");
             }
+            promoteAvailableSeats();
             if (enrolled.size() < offering.getCapacity()) {
                 enrolled.add(learnerId);
                 log.info("Learner enrolled, learnerId={}, courseId={}, enrolledCount={}, capacity={}",
@@ -122,7 +130,7 @@ public final class CourseRegistrationService {
                         "Learner " + learnerId + " is not currently enrolled", null);
             }
             log.info("Learner dropped, learnerId={}, courseId={}", learnerId, offering.getId());
-            String promotedId = promoteEarliestEligible();
+            String promotedId = promoteAvailableSeats();
             String message = promotedId == null
                     ? "Learner " + learnerId + " dropped; seat left open (no eligible waitlisted learner)"
                     : "Learner " + learnerId + " dropped; learner " + promotedId + " promoted from waitlist";
@@ -132,6 +140,20 @@ public final class CourseRegistrationService {
         }
     }
 
+    private String promoteAvailableSeats() {
+        String firstPromotedId = null;
+        while (enrolled.size() < offering.getCapacity()) {
+            String promotedId = promoteEarliestEligible();
+            if (promotedId == null) {
+                break;
+            }
+            if (firstPromotedId == null) {
+                firstPromotedId = promotedId;
+            }
+        }
+        return firstPromotedId;
+    }
+
     /**
      * Promotes the earliest eligible learner on the waitlist into the now-open seat.
      * Ineligible learners encountered along the way are skipped and remain waitlisted.
@@ -139,6 +161,9 @@ public final class CourseRegistrationService {
      * @return the promoted learner's id, or {@code null} if no eligible learner was found.
      */
     private String promoteEarliestEligible() {
+        if (waitlist.isEmpty()) {
+            return null;
+        }
         Iterator<String> it = waitlist.iterator();
         while (it.hasNext()) {
             String candidateId = it.next();

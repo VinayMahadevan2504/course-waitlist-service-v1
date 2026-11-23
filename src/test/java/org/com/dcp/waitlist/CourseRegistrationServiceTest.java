@@ -137,6 +137,41 @@ class CourseRegistrationServiceTest {
     }
 
     @Test
+    void updatedWaitlistedLearnerIsPromotedWhenTheyBecomeEligible() {
+        service.enroll("alice");
+        service.enroll("bob");
+        service.enroll("carol");
+        service.registerLearner(noPrereqLearner("carol"));
+
+        service.drop("alice");
+        assertFalse(service.getEnrolledLearnerIds().contains("carol"));
+        assertEquals(List.of("carol"), service.getWaitlistedLearnerIds());
+
+        service.registerLearner(learner("carol"));
+
+        assertTrue(service.getEnrolledLearnerIds().contains("carol"));
+        assertFalse(service.getWaitlistedLearnerIds().contains("carol"));
+    }
+
+    @Test
+    void newEligibleLearnerCanTakeOpenSeatWhileIneligibleWaiterKeepsTheirPlace() {
+        service.enroll("alice");
+        service.enroll("bob");
+        service.enroll("carol");
+        service.registerLearner(noPrereqLearner("carol"));
+        service.drop("alice");
+
+        EnrollmentResult queuedRetry = service.enroll("carol");
+        service.registerLearner(learner("frank"));
+        EnrollmentResult newLearner = service.enroll("frank");
+
+        assertEquals(EnrollmentStatus.ALREADY_WAITLISTED, queuedRetry.status());
+        assertEquals(EnrollmentStatus.ENROLLED, newLearner.status());
+        assertEquals(List.of("bob", "frank"), service.getEnrolledLearnerIds());
+        assertEquals(List.of("carol"), service.getWaitlistedLearnerIds());
+    }
+
+    @Test
     void invalidEnrollRequestForUnknownLearnerReturnsClearResultWithoutCorruptingState() {
         EnrollmentResult result = service.enroll("unknown-learner");
 

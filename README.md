@@ -12,15 +12,15 @@ full design specification and `AI-USAGE.md` for the AI prompt/use record.
 ## Project Layout
 
 ```
-src/main/java/org/example/waitlist/
+src/main/java/org/com/dcp/waitlist/
   Learner.java                     - learner id, name, completed-course ids
   CourseOffering.java               - offering id, capacity, optional prerequisite, eligibility rule
   LearnerDirectory.java              - package-private roster lookup/upsert (SRP-separated from the service)
   EnrollmentStatus.java / EnrollmentResult.java
   DropStatus.java / DropResult.java
   CourseRegistrationService.java    - the service boundary: enroll / drop / promote (SLF4J logging)
-src/main/java/org/example/Main.java - small runnable CLI demo
-src/test/java/org/example/waitlist/
+src/main/java/org/com/dcp/Application.java - small runnable CLI demo
+src/test/java/org/com/dcp/waitlist/
   CourseRegistrationServiceTest.java            - functional tests (capacity, FIFO, prerequisites, invalid/duplicate requests)
   CourseRegistrationServiceConcurrencyTest.java - focused concurrency test
 ```
@@ -31,7 +31,7 @@ src/test/java/org/example/waitlist/
 mvn test
 ```
 
-Expected: `Tests run: 14, Failures: 0, Errors: 0` and `BUILD SUCCESS`.
+Expected: `Tests run: 17, Failures: 0, Errors: 0` and `BUILD SUCCESS`.
 
 ## Run the demo
 
@@ -41,7 +41,7 @@ so the demo needs those jars on the classpath alongside `target\classes`:
 ```powershell
 mvn -q compile
 mvn -q dependency:build-classpath "-Dmdep.outputFile=cp.txt"
-java -cp "target\classes;$(Get-Content cp.txt -Raw)" org.example.Main
+java -cp "target\classes;$(Get-Content cp.txt -Raw)" org.com.dcp.Application
 Remove-Item cp.txt
 ```
 
@@ -57,7 +57,12 @@ or other PII).
   cleanly (`ALREADY_ENROLLED` / `ALREADY_WAITLISTED`) without creating duplicate records.
 - Dropping an enrolled learner promotes the earliest **eligible** waitlisted learner (FIFO);
   an ineligible learner at the front is skipped and stays on the waitlist (see `DESIGN.md` §5).
+- When roster data is updated or an enrollment request finds open capacity, eligible existing
+  waitlisted learners are promoted before a new learner can take a seat. If no waitlisted learner
+  is eligible, the seat remains available to a new eligible learner; ineligible waitlisted
+  learners retain their positions.
 - Invalid requests (unknown learner) and duplicate drops return a clear typed result without
   corrupting state.
-- Concurrent enroll requests are safe: `CourseRegistrationServiceConcurrencyTest` verifies no
-  overbooking and no lost/duplicated records under contention.
+- Concurrent enroll requests and concurrent drops/enrollments are safe:
+  `CourseRegistrationServiceConcurrencyTest` verifies no overbooking and no lost/duplicated
+  records under contention.
